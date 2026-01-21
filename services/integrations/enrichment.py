@@ -36,7 +36,11 @@ class MockEnrichmentProvider(EnrichmentProvider):
             "location": "San Francisco, CA",
             "country": "United States",
             "city": "San Francisco",
-            "twitter_handle": f"@{username}"
+            "twitter_handle": f"@{username}",
+            # Extra fields to test custom_fields
+            "bio": f"Experienced professional in {username} industry.",
+            "skills": ["Sales", "Marketing", "SaaS"],
+            "interests": "Technology, Hiking, Coffee"
         }
     
     async def verify_email(self, email: str) -> bool:

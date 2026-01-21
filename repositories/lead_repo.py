@@ -146,10 +146,17 @@ class LeadRepository(BaseRepository[Lead]):
         if not lead:
             return None
         
+        if lead.custom_fields is None:
+            lead.custom_fields = {}
+
         # Update enrichment fields
         for field, value in enrichment_data.items():
-            if hasattr(lead, field) and value is not None:
-                setattr(lead, field, value)
+            if hasattr(lead, field):
+                if value is not None:
+                    setattr(lead, field, value)
+            else:
+                # Store unknown fields in custom_fields
+                lead.custom_fields[field] = value
         
         lead.enrichment_status = status
         lead.enriched_at = datetime.utcnow()
