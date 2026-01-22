@@ -32,6 +32,10 @@ class Lead(SQLModel, table=True):
     personal_email: Optional[str] = None
     mobile_phone: Optional[str] = None
     
+    # Phone numbers (Apollo enrichment)
+    phone_numbers: List[dict] = Field(default=[], sa_column=Column(JSONB))
+    # Example: [{"number": "+1234567890", "type": "mobile", "verified": true}]
+    
     # Social
     twitter_handle: Optional[str] = None
     
@@ -56,6 +60,11 @@ class Lead(SQLModel, table=True):
     is_email_verified: bool = Field(default=False)
     enrichment_status: str = Field(default="pending")  # pending, enriched, failed
     enriched_at: Optional[datetime] = None
+    
+    # Apollo.io specific enrichment
+    apollo_enriched_at: Optional[datetime] = None
+    apollo_match_confidence: Optional[float] = None  # 0-1
+    apollo_credits_used: int = Field(default=0)
     
     # Tags for organization
     tags: List[str] = Field(default=[], sa_column=Column(JSONB))

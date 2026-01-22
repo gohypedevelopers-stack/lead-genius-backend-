@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     AI_MODEL: str = "gpt-4o-mini"  # or gpt-4, claude-3-5-sonnet, etc.
     
+    # Apollo.io Settings (for lead enrichment)
+    APOLLO_API_KEY: str = ""
+    APOLLO_AUTO_ENRICH: bool = True  # Auto-enrich high-value leads
+    APOLLO_MIN_SCORE_FOR_ENRICH: int = 70  # Only enrich leads with score >= 70
+    
     class Config:
         env_file = ".env"
 

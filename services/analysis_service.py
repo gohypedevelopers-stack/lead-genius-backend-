@@ -199,6 +199,7 @@ class AnalysisService:
     def _create_lead_from_interaction(self, session: Session, interaction: PostInteraction, post: LinkedInPost):
         """
         Auto-creates a Lead from a high-value interaction.
+        Triggers Apollo enrichment if configured.
         """
         # Check if lead already exists
         existing = session.exec(
@@ -236,6 +237,57 @@ class AnalysisService:
         session.add(interaction)
         
         logger.info(f"Created Lead {lead.id} from interaction {interaction.id}")
+        
+        # Trigger Apollo enrichment if enabled and lead meets criteria
+        if settings.APOLLO_AUTO_ENRICH and lead.score >= settings.APOLLO_MIN_SCORE_FOR_ENRICH:
+            self._trigger_apollo_enrichment(lead.id)
+    
+    def _trigger_apollo_enrichment(self, lead_id: uuid.UUID):
+        """
+        Triggers Apollo enrichment for a lead (async call).
+        """
+        try:
+            from backend.services.apollo_service import apollo_service
+            
+            with Session(engine) as session:
+                lead = session.get(Lead, lead_id)
+                if not lead:
+                    return
+                
+                # Call Apollo API
+                result = apollo_service.enrich_person(
+                    linkedin_url=lead.linkedin_url,
+                    first_name=lead.name.split()[0] if lead.name else None,
+                    last_name=" ".join(lead.name.split()[1:]) if lead.name and len(lead.name.split()) > 1 else None,
+                    company_name=lead.company
+                )
+                
+                if result["success"]:
+                    person_data = result["person"]
+                    contact_info = apollo_service.extract_contact_info(person_data)
+                    
+                    # Update lead
+                    if contact_info["primary_email"]:
+                        lead.email = contact_info["primary_email"]
+                        lead.is_email_verified = True
+                    if contact_info["primary_phone"]:
+                        lead.mobile_phone = contact_info["primary_phone"]
+                    if contact_info["all_phones"]:
+                        lead.phone_numbers = contact_info["all_phones"]
+                    
+                    lead.enrichment_status = "enriched"
+                    lead.enriched_at = datetime.utcnow()
+                    lead.apollo_enriched_at = datetime.utcnow()
+                    lead.apollo_match_confidence = contact_info["confidence"]
+                    lead.apollo_credits_used = result.get("credits_used", 1)
+                    
+                    session.add(lead)
+                    session.commit()
+                    logger.info(f"Auto-enriched lead {lead_id} via Apollo (score: {lead.score})")
+                else:
+                    logger.warning(f"Apollo auto-enrichment failed for lead {lead_id}: {result.get('error')}")
+        except Exception as e:
+            logger.error(f"Failed to trigger Apollo enrichment: {str(e)}")
 
 analysis_service = AnalysisService()
 
