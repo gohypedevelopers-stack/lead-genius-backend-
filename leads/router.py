@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
-from typing import List
+from typing import List, Optional
 from backend.database import get_session
 from backend.leads.models import Lead
 from backend.users.models import User
@@ -68,10 +68,13 @@ async def enrich_lead(
 
 @router.get("/", response_model=List[Lead])
 async def list_leads(
+    campaign_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
     statement = select(Lead).where(Lead.org_id == current_user.current_org_id)
+    if campaign_id:
+        statement = statement.where(Lead.campaign_id == campaign_id)
     results = await session.exec(statement)
     return results.all()
 

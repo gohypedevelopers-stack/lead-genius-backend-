@@ -69,4 +69,51 @@ class ApifyService:
             logger.error(f"Failed to get run details {run_id}: {str(e)}")
             return None
 
+    async def call_actor(self, actor_id: str, run_input: dict, timeout_secs: int = 300) -> Optional[str]:
+        """
+        Calls an Apify actor synchronously (waiting for finish) but non-blocking to the event loop.
+        Returns the default dataset ID if successful.
+        """
+        import asyncio
+        
+        loop = asyncio.get_running_loop()
+        
+        def _run():
+             return self.client.actor(actor_id).call(
+                run_input=run_input,
+                wait_secs=timeout_secs
+            )
+            
+        try:
+            logger.info(f"Calling Apify actor {actor_id}...")
+            run = await loop.run_in_executor(None, _run)
+            if run and run.get("status") == "SUCCEEDED":
+                logger.info(f"Apify run {run.get('id')} succeeded.")
+                return run.get("defaultDatasetId")
+            else:
+                logger.error(f"Apify run failed or timed out. Status: {run.get('status') if run else 'Unknown'}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to call Apify actor {actor_id}: {str(e)}")
+            return None
+
+    async def get_dataset_items_async(self, dataset_id: str):
+        """
+        Retrieves the results from a dataset asynchronously (wrapping sync client).
+        """
+        import asyncio
+        
+        loop = asyncio.get_running_loop()
+        
+        def _fetch():
+            dataset_client = self.client.dataset(dataset_id)
+            return dataset_client.list_items().items
+            
+        try:
+            items = await loop.run_in_executor(None, _fetch)
+            return items
+        except Exception as e:
+            logger.error(f"Failed to fetch dataset {dataset_id}: {str(e)}")
+            return []
+
 apify_service = ApifyService()

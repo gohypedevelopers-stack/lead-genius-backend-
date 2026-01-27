@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     LINKEDIN_CLIENT_SECRET: str = ""
 
     # Apify Settings
-    APIFY_API_TOKEN: str = "apify_api_token_here"
+    APIFY_API_TOKEN: str = "apify_api_yasIcqzhgdPZSuzNoMDlLpipTGqJu93J8OFS"
     APIFY_WEBHOOK_SECRET: str = "webhook_secret"
     
     # OpenAI Settings (for AI-powered analysis)

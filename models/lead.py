@@ -79,3 +79,22 @@ class Lead(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     last_contacted_at: Optional[datetime] = None
+
+    # Save Everything Strategy
+    profile_data: dict = Field(default={}, sa_type=JSONB) # Store full Apify profile object
+
+
+class LeadInteraction(SQLModel, table=True):
+    __tablename__ = "lead_interaction"
+    
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    lead_id: uuid.UUID = Field(foreign_key="lead.id", index=True)
+    campaign_id: Optional[uuid.UUID] = Field(default=None, foreign_key="campaign.id", index=True)
+    
+    type: str = Field(index=True) # comment, reaction, post_author, repost
+    content: Optional[str] = None # The text content (comment text, etc.)
+    source_url: Optional[str] = None # Link to the specific comment/post
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    raw_data: dict = Field(default={}, sa_type=JSONB) # Full event data (reaction type, etc.)

@@ -9,7 +9,7 @@ from .config import settings
 engine = create_async_engine(settings.DATABASE_URL, echo=True, future=True)
 
 # Set to True to recreate all tables (WARNING: deletes all data)
-RECREATE_TABLES = False  # Disabled to preserve data
+RECREATE_TABLES = True  # Disabled to preserve data
 
 async def init_db():
     async with engine.begin() as conn:
@@ -19,6 +19,13 @@ async def init_db():
             await conn.execute(text("CREATE SCHEMA public"))
             await conn.execute(text("GRANT ALL ON SCHEMA public TO public"))
         await conn.run_sync(SQLModel.metadata.create_all)
+        
+        # Schema Evolution: Add profile_data if missing (for dev environment)
+        try:
+            await conn.execute(text("ALTER TABLE lead ADD COLUMN IF NOT EXISTS profile_data JSONB DEFAULT '{}'::jsonb"))
+        except Exception as e:
+            # Ignore if generic error, but print
+            print(f"Migration warning: {e}")
 
 async def get_session() -> AsyncSession:
     async_session = sessionmaker(

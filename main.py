@@ -21,6 +21,8 @@ from backend.models import (
     ActivityLog, Webhook, WebhookDelivery,
     LinkedInCredential, LinkedInPreference
 )
+from backend.campaigns.run_models import CampaignRun
+from backend.models.lead import LeadInteraction
 
 
 @asynccontextmanager

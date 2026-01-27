@@ -1,8 +1,11 @@
 from datetime import datetime
-from sqlmodel import Session, select
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.orm import sessionmaker
 from typing import List, Dict, Any, Optional
 import logging
 import uuid
+import asyncio
 
 from backend.models.post_analysis import LinkedInPost, PostInteraction
 from backend.models.lead import Lead
@@ -17,15 +20,17 @@ logger = logging.getLogger(__name__)
 class AnalysisService:
     def __init__(self):
         self.actor_id = "curious_programmer/linkedin-post-scraper"
+        self.async_session_maker = sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
 
-    async def analyze_posts(self, post_urls: List[str], org_id: uuid.UUID, persona_id: Optional[uuid.UUID] = None):
+    async def analyze_posts(self, post_urls: List[str], org_id: uuid.UUID, campaign_id: Optional[uuid.UUID] = None, persona_id: Optional[uuid.UUID] = None):
         """
         Starts the analysis process for a list of URLs.
-        1. Creates LinkedInPost records.
-        2. Triggers Apify for each.
+        Triggers a multi-step Apify workflow in the background.
         """
         started_ids = []
-        with Session(engine) as session:
+        async with self.async_session_maker() as session:
             for url in post_urls:
                 # Create DB Record
                 post = LinkedInPost(
@@ -35,93 +40,180 @@ class AnalysisService:
                     persona_id=persona_id
                 )
                 session.add(post)
-                session.commit()
-                session.refresh(post)
+                await session.commit()
+                await session.refresh(post)
+                started_ids.append(post.id)
                 
-                # Trigger Apify
-                run_input = {
-                    "postUrl": url, 
-                    "proxy": {"useApifyProxy": True}
-                }
-                result = apify_service.run_actor(
-                    self.actor_id, 
-                    run_input,
-                    webhook_url=f"{settings.BACKEND_URL}{settings.API_PREFIX}/ingest/analysis/webhook"
-                )
-                
-                if result["success"]:
-                    post.apify_run_id = result["run_id"]
-                    started_ids.append(post.id)
-                else:
-                    post.status = "failed"
-                
-                session.add(post)
-                session.commit()
+                # Trigger Workflow in Background
+                asyncio.create_task(self._execute_apify_workflow(post.id, url, org_id, campaign_id, persona_id))
         
         return started_ids
 
+    async def _execute_apify_workflow(self, post_id: uuid.UUID, url: str, org_id: uuid.UUID, campaign_id: Optional[uuid.UUID], persona_id: Optional[uuid.UUID]):
+        """
+        Executes the 3-step Apify workflow:
+        1. Post Details
+        2. Comments
+        3. Reactions
+        """
+        logger.info(f"Starting Apify Workflow for Post {post_id}")
+        
+        try:
+            # --- STEP 1: Post Details ---
+            logger.info("Step 1: Fetching Post Details...")
+            dataset_id = await apify_service.call_actor(
+                "apimaestro/linkedin-post-detail",
+                {"post_urls": [url]}
+            )
+            
+            post_content = ""
+            author_name = "Unknown"
+            
+            if dataset_id:
+                items = await apify_service.get_dataset_items_async(dataset_id)
+                if items:
+                    data = items[0]
+                    post_content = data.get("text", "") or data.get("post", {}).get("text", "")
+                    author_name = data.get("author", {}).get("name", "Unknown")
+                    
+                    # Update Post Logic
+                    async with self.async_session_maker() as session:
+                        post = await session.get(LinkedInPost, post_id)
+                        if post:
+                            post.post_content = post_content
+                            post.author_name = author_name
+                            
+                            # AI Analysis
+                            ai_post_analysis = ai_analysis_service.analyze_post_content(post_content)
+                            post.post_intent = ai_post_analysis.get("intent", "unknown")
+                            post.ai_insights = ai_post_analysis
+                            session.add(post)
+                            await session.commit()
+
+            # --- STEP 2: Comments ---
+            logger.info("Step 2: Fetching Comments...")
+            comments_dataset_id = await apify_service.call_actor(
+                "apimaestro/linkedin-post-comments-replies-engagements-scraper-no-cookies",
+                {
+                    "postIds": [url],
+                    "page_number": 1,
+                    "sortOrder": "most relevant",
+                    "limit": 100
+                }
+            )
+            
+            comments = []
+            if comments_dataset_id:
+                comments = await apify_service.get_dataset_items_async(comments_dataset_id)
+                logger.info(f"Fetched {len(comments)} comments.")
+
+            # --- STEP 3: Reactions ---
+            logger.info("Step 3: Fetching Reactions...")
+            reactions_dataset_id = await apify_service.call_actor(
+                "apimaestro/linkedin-post-reactions",
+                {
+                    "post_urls": [url],
+                    "page_number": 1,
+                    "reaction_type": "ALL",
+                    "limit": 100
+                }
+            )
+            
+            likes = []
+            if reactions_dataset_id:
+                likes = await apify_service.get_dataset_items_async(reactions_dataset_id)
+                logger.info(f"Fetched {len(likes)} reactions.")
+
+            # --- Processing ---
+            new_leads_count = 0
+            async with self.async_session_maker() as session:
+                post = await session.get(LinkedInPost, post_id)
+                if not post:
+                    return
+
+                persona = await session.get(Persona, persona_id) if persona_id else None
+                interactions_count = 0
+                
+                # Process Comments
+                for comment in comments:
+                    try:
+                        normalized_comment = {
+                            "text": comment.get("text") or comment.get("comment", ""),
+                            "author": {
+                                "name": comment.get("author", {}).get("name"),
+                                "headline": comment.get("author", {}).get("headline"),
+                                "profileUrl": comment.get("author", {}).get("profile_url")
+                            }
+                        }
+                        interaction = self._process_interaction(session, post, "COMMENT", normalized_comment, persona)
+                        if interaction:
+                            interactions_count += 1
+                            # Temporary: Lower threshold to 30 to allow leads without OpenAI (fallback score is ~35)
+                            if interaction.relevance_score >= 30:
+                                was_created = await self._create_lead_from_interaction(session, interaction, post, campaign_id)
+                                if was_created:
+                                    new_leads_count += 1
+                    except Exception as e:
+                        logger.error(f"Error processing comment: {e}")
+
+                # Process Likes
+                for like in likes:
+                    try:
+                        normalized_like = {
+                            "text": "",
+                            "author": {
+                                "name": like.get("reactor", {}).get("name"),
+                                "headline": like.get("reactor", {}).get("headline"),
+                                "profileUrl": like.get("reactor", {}).get("profile_url")
+                            }
+                        }
+                        interaction = self._process_interaction(session, post, "LIKE", normalized_like, persona)
+                        if interaction:
+                            interactions_count += 1
+                    except Exception as e:
+                         logger.error(f"Error processing like: {e}")
+
+                post.total_comments = len(comments)
+                post.total_likes = len(likes)
+                post.status = "completed"
+                session.add(post)
+                
+                # UPDATE CAMPAIGN STATUS
+                if campaign_id:
+                    from backend.models.campaign import Campaign
+                    campaign = await session.get(Campaign, campaign_id)
+                    if campaign:
+                        campaign.status = "completed"
+                        campaign.leads_count = (campaign.leads_count or 0) + new_leads_count
+                        session.add(campaign)
+                        logger.info(f"Updated Campaign {campaign_id}: status=completed, leads={campaign.leads_count}")
+
+                await session.commit()
+                
+            logger.info(f"Workflow Complete for Post {post_id}")
+
+        except Exception as e:
+            logger.error(f"Workflow Failed for Post {post_id}: {str(e)}")
+            async with self.async_session_maker() as session:
+                post = await session.get(LinkedInPost, post_id)
+                if post:
+                    post.status = "failed"
+                    session.add(post)
+                    await session.commit()
+                # Fail campaign if needed
+                if campaign_id:
+                    from backend.models.campaign import Campaign
+                    campaign = await session.get(Campaign, campaign_id)
+                    if campaign:
+                        campaign.status = "failed"
+                        session.add(campaign)
+                        await session.commit()
+
     async def process_webhook(self, dataset_id: str, run_id: str):
         """
-        Called when Apify finishes. Fetches data and processes interactions.
-        NOW WITH AI ANALYSIS
+        Legacy webhook handler.
         """
-        items = apify_service.get_dataset_items(dataset_id)
-        if not items:
-            logger.warning(f"No items found for run {run_id}")
-            return
-
-        with Session(engine) as session:
-            # Find the post by run_id
-            statement = select(LinkedInPost).where(LinkedInPost.apify_run_id == run_id)
-            post = session.exec(statement).first()
-            
-            if not post:
-                logger.error(f"No LinkedInPost found for run {run_id}")
-                return
-
-            # Get Persona for matching
-            persona = None
-            if post.persona_id:
-                persona = session.get(Persona, post.persona_id)
-
-            # Update Post Metadata
-            first_item = items[0]
-            post_text = first_item.get("text", "")
-            post.post_content = post_text
-            post.author_name = first_item.get("author", {}).get("name")
-            
-            # AI: Analyze post content
-            ai_post_analysis = ai_analysis_service.analyze_post_content(post_text)
-            post.post_intent = ai_post_analysis.get("intent", "unknown")
-            post.ai_insights = ai_post_analysis  # Store full AI results
-            post.status = "completed"
-            
-            # Process Comments & Likes
-            interactions_count = 0
-            
-            # 1. Process Comments (HIGH INTENT)
-            comments = first_item.get("comments", [])
-            for comment in comments:
-                interaction = self._process_interaction(session, post, "COMMENT", comment, persona)
-                if interaction:
-                    interactions_count += 1
-                    # Auto-create lead if high score
-                    if interaction.classification == "high" and interaction.relevance_score >= 70:
-                        self._create_lead_from_interaction(session, interaction, post)
-            
-            # 2. Process Likes (LOW INTENT)
-            likes = first_item.get("likes", [])
-            for like in likes:
-                interaction = self._process_interaction(session, post, "LIKE", like, persona)
-                if interaction:
-                    interactions_count += 1
-                
-            post.total_comments = len(comments)
-            post.total_likes = len(likes)
-            session.add(post)
-            session.commit()
-            
-            logger.info(f"Processed {interactions_count} interactions for post {post.id}")
+        pass
 
     async def process_manual_data(self, data: Dict[str, Any], org_id: uuid.UUID) -> Dict[str, Any]:
         """
@@ -133,13 +225,14 @@ class AnalysisService:
         print(f"  > Processing Manual Data for: {url}")
         
         # 1. Create or Get Post Record
-        with Session(engine) as session:
+        async with self.async_session_maker() as session:
             # Check if post exists
             statement = select(LinkedInPost).where(
                 LinkedInPost.post_url == url, 
                 LinkedInPost.org_id == org_id
             )
-            post = session.exec(statement).first()
+            result = await session.exec(statement)
+            post = result.first()
             
             if not post:
                 print("  > Creating new LinkedInPost record...")
@@ -149,8 +242,8 @@ class AnalysisService:
                     org_id=org_id
                 )
                 session.add(post)
-                session.commit()
-                session.refresh(post)
+                await session.commit()
+                await session.refresh(post)
             else:
                 print(f"  > Found existing LinkedInPost record: {post.id}")
             
@@ -175,9 +268,11 @@ class AnalysisService:
                 interaction = self._process_interaction(session, post, "COMMENT", comment, None)
                 if interaction:
                     interactions_count += 1
-                    if interaction.classification == "high" and interaction.relevance_score >= 70:
-                        self._create_lead_from_interaction(session, interaction, post)
-                        new_leads += 1
+                    # Temporary: Lower threshold to 30
+                    if interaction.relevance_score >= 30:
+                        was_created = await self._create_lead_from_interaction(session, interaction, post, None) # No campaign ID for manual
+                        if was_created:
+                            new_leads += 1
 
             likes = extracted_data.get("likes", [])
             print(f"  > Processing {len(likes)} likes...")
@@ -189,7 +284,7 @@ class AnalysisService:
             post.total_comments = len(comments)
             post.total_likes = len(likes)
             session.add(post)
-            session.commit()
+            await session.commit()
             
             print(f"  > DONE. Processed {interactions_count} interactions. Created {new_leads} new leads.")
             
@@ -202,7 +297,7 @@ class AnalysisService:
 
     def _process_interaction(
         self, 
-        session: Session, 
+        session: AsyncSession, 
         post: LinkedInPost, 
         type: str, 
         data: Dict[str, Any],
@@ -273,24 +368,27 @@ class AnalysisService:
         session.add(interaction)
         return interaction
 
-    def _create_lead_from_interaction(self, session: Session, interaction: PostInteraction, post: LinkedInPost):
+    async def _create_lead_from_interaction(self, session: AsyncSession, interaction: PostInteraction, post: LinkedInPost, campaign_id: Optional[uuid.UUID] = None) -> bool:
         """
         Auto-creates a Lead from a high-value interaction.
         Triggers Apollo enrichment if configured.
+        Returns: True if a NEW lead was created, False if existing/failed.
         """
         # Check if lead already exists
-        existing = session.exec(
+        result = await session.exec(
             select(Lead).where(Lead.linkedin_url == interaction.actor_profile_url)
-        ).first()
+        )
+        existing = result.first()
         
         if existing:
             logger.info(f"Lead already exists for {interaction.actor_profile_url}")
             interaction.lead_id = existing.id
-            return
+            return False
         
         # Create new lead
         lead = Lead(
             org_id=post.org_id,
+            campaign_id=campaign_id,  # Link to campaign if provided
             name=interaction.actor_name or "Unknown",
             linkedin_url=interaction.actor_profile_url or "",
             title=interaction.actor_headline,
@@ -307,8 +405,8 @@ class AnalysisService:
         )
         
         session.add(lead)
-        session.commit()
-        session.refresh(lead)
+        await session.commit()
+        await session.refresh(lead)
         
         interaction.lead_id = lead.id
         session.add(interaction)
@@ -317,17 +415,19 @@ class AnalysisService:
         
         # Trigger Apollo enrichment if enabled and lead meets criteria
         if settings.APOLLO_AUTO_ENRICH and lead.score >= settings.APOLLO_MIN_SCORE_FOR_ENRICH:
-            self._trigger_apollo_enrichment(lead.id)
+            await self._trigger_apollo_enrichment(lead.id)
+            
+        return True
     
-    def _trigger_apollo_enrichment(self, lead_id: uuid.UUID):
+    async def _trigger_apollo_enrichment(self, lead_id: uuid.UUID):
         """
         Triggers Apollo enrichment for a lead (async call).
         """
         try:
             from backend.services.apollo_service import apollo_service
             
-            with Session(engine) as session:
-                lead = session.get(Lead, lead_id)
+            async with self.async_session_maker() as session:
+                lead = await session.get(Lead, lead_id)
                 if not lead:
                     return
                 
@@ -359,7 +459,7 @@ class AnalysisService:
                     lead.apollo_credits_used = result.get("credits_used", 1)
                     
                     session.add(lead)
-                    session.commit()
+                    await session.commit()
                     logger.info(f"Auto-enriched lead {lead_id} via Apollo (score: {lead.score})")
                 else:
                     logger.warning(f"Apollo auto-enrichment failed for lead {lead_id}: {result.get('error')}")

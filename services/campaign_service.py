@@ -158,9 +158,9 @@ class CampaignService:
             url = campaign.settings.get("url")
             
             if url and use_apify:
-                await analysis_service.analyze_posts([url], org_id)
-                # Note: Results come back via webhook
-                pass
+                # Pass campaign_id so AnalysisService updates it on completion
+                await analysis_service.analyze_posts([url], org_id, campaign_id=campaign_id)
+                # Campaign status will be updated by AnalysisService asynchronously
             
             return campaign
 
