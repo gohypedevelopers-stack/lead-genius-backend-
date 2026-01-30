@@ -1,25 +1,126 @@
 from openai import OpenAI
+import google.generativeai as genai
 from backend.config import settings
 import logging
 import json
+import time
 
 logger = logging.getLogger(__name__)
 
 class AIAnalysisService:
     def __init__(self):
-        self.client = OpenAI(api_key=settings.OPENAI_API_KEY) if settings.OPENAI_API_KEY else None
+        self.provider = "openai"
+        self.client = None
         self.model = settings.AI_MODEL
-    
-    def analyze_post_content(self, post_text: str, customer_product: str = "") -> dict:
+        
+        # Initialize Gemini if configured (preferred or if OpenAI missing)
+        if hasattr(settings, 'GEMINI_API_KEY') and settings.GEMINI_API_KEY:
+            try:
+                genai.configure(api_key=settings.GEMINI_API_KEY)
+                self.client = genai.GenerativeModel(settings.AI_MODEL)
+                self.provider = "gemini"
+                logger.info("AI Service initialized with Gemini")
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini: {e}")
+
+        # Fallback/Default to OpenAI if Gemini not set but OpenAI is
+        if not self.client and settings.OPENAI_API_KEY:
+            try:
+                self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                self.provider = "openai"
+                logger.info("AI Service initialized with OpenAI")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI: {e}")
+
+    def _generate_content(self, prompt: str, json_mode: bool = True) -> str:
+        """Helper to generate content from either provider."""
+        if not self.client:
+            raise ValueError("AI Client not initialized")
+
+        if self.provider == "gemini":
+            # Gemini generation
+            max_retries = 3
+            base_delay = 60 # Seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    # For JSON mode in Gemini, it's often best to just ask strict JSON in prompt
+                    # and maybe strip markdown blocks.
+                    response = self.client.generate_content(prompt)
+                    text = response.text
+                    # Clean markdown code blocks if present
+                    if text.startswith("```json"):
+                        text = text[7:]
+                    if text.startswith("```"):
+                        text = text[3:]
+                    if text.endswith("```"):
+                        text = text[:-3]
+                    return text.strip()
+                except Exception as e:
+                    is_rate_limit = "429" in str(e) or "quota" in str(e).lower()
+                    if is_rate_limit and attempt < max_retries - 1:
+                        logger.warning(f"Gemini Rate Limit Hit. Waiting {base_delay}s... (Attempt {attempt+1}/{max_retries})")
+                        time.sleep(base_delay)
+                    else:
+                        logger.error(f"Gemini generation failed: {e}")
+                        raise
+
+        else:
+            # OpenAI generation
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"} if json_mode else None,
+                temperature=0.2
+            )
+            return response.choices[0].message.content
+
+    def score_lead(self, lead_data: dict, interactions: list) -> dict:
         """
-        Uses AI to analyze the post content and extract:
-        - Intent (problem, solution-seeking, discussion, promotion)
-        - Topics/keywords
-        - Relevance to customer's product
+        Score a lead based on profile and interactions using AI.
+        Returns JSON with score (0-100) and reasoning.
         """
         if not self.client:
+            return {"score": 50, "reasoning": "AI not configured, using neutral score."}
+
+        prompt = f"""
+        Act as a B2B Sales Scoring Expert. Evaluate this lead validation score (0-100).
+        
+        LEAD PROFILE:
+        Name: {lead_data.get('name')}
+        Title: {lead_data.get('title')}
+        Company: {lead_data.get('company')}
+        Headline: {lead_data.get('headline', '')}
+        About: {lead_data.get('about', '')} (truncated)
+        
+        INTERACTIONS:
+        {json.dumps(interactions, default=str)}
+        
+        SCORING CRITERIA:
+        1. ICP Fit (40%): Is this a decision maker (VP, C-Level, Director) in a relevant industry?
+        2. Engagement (40%): Did they comment or react? Comments are high intent.
+        3. Completeness (20%): Do we have email, LinkedIn URL, etc?
+        
+        OUTPUT FORMAT (JSON ONLY):
+        {{
+            "score": <integer 0-100>,
+            "reasoning": "<concise explanation of the score>",
+            "quality_tier": "<High/Medium/Low>"
+        }}
+        """
+        
+        try:
+            result_text = self._generate_content(prompt)
+            return json.loads(result_text)
+        except Exception as e:
+            logger.error(f"AI scoring failed: {e}")
+            return {"score": 50, "reasoning": "AI scoring failed, check logs."}
+
+    def analyze_post_content(self, post_text: str, customer_product: str = "") -> dict:
+        """Uses AI to analyze post content."""
+        if not self.client:
             logger.warning("OpenAI not configured, skipping AI analysis")
-            return {"intent": "unknown", "topics": [], "relevance_score": 50}
+            return {"intent": "unknown", "topics": [], "relevance_score": 50, "summary": ""}
         
         prompt = f"""Analyze this LinkedIn post and return a JSON response:
 
@@ -31,32 +132,16 @@ Return JSON with:
 - topics: list of 3-5 main topics/keywords
 - relevance_score: 0-100 how relevant to customer's product
 - summary: one-line summary
-
-Example: {{"intent": "problem", "topics": ["CRM", "sales automation"], "relevance_score": 85, "summary": "User seeking CRM recommendations"}}
 """
-        
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.3
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            return result
+            result_text = self._generate_content(prompt)
+            return json.loads(result_text)
         except Exception as e:
-            logger.error(f"AI post analysis failed: {str(e)}")
+            logger.error(f"AI post analysis failed: {e}")
             return {"intent": "unknown", "topics": [], "relevance_score": 50, "summary": ""}
     
     def evaluate_profile(self, name: str, headline: str, comment_text: str, persona_definition: dict) -> dict:
-        """
-        AI-powered profile evaluation:
-        - Classify as Individual or Company
-        - Extract role, seniority, industry signals
-        - Match against persona
-        - Detect buying intent from comment
-        """
+        """AI-powered profile evaluation."""
         if not self.client:
             return self._fallback_evaluation(headline)
         
@@ -79,22 +164,13 @@ Return JSON with:
 - intent_from_comment: "high" (asking, seeking solution), "medium" (sharing opinion), "low" (general engagement)
 - persona_fit_score: 0-100
 - reasoning: brief explanation
-
-Example: {{"profile_type": "individual", "role_category": "decision_maker", "seniority_level": "VP", "industry_match": true, "intent_from_comment": "high", "persona_fit_score": 92, "reasoning": "VP Sales in SaaS, actively seeking solutions"}}
 """
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.2
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            return result
+            result_text = self._generate_content(prompt)
+            return json.loads(result_text)
         except Exception as e:
-            logger.error(f"AI profile evaluation failed: {str(e)}")
+            logger.error(f"AI profile evaluation failed: {e}")
             return self._fallback_evaluation(headline)
     
     def _fallback_evaluation(self, headline: str) -> dict:

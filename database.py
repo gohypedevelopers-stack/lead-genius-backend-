@@ -9,7 +9,7 @@ from .config import settings
 engine = create_async_engine(settings.DATABASE_URL, echo=True, future=True)
 
 # Set to True to recreate all tables (WARNING: deletes all data)
-RECREATE_TABLES = True  # Disabled to preserve data
+RECREATE_TABLES = False  # Disabled to preserve data
 
 async def init_db():
     async with engine.begin() as conn:

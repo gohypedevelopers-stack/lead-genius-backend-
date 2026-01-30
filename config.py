@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -36,12 +37,13 @@ class Settings(BaseSettings):
     LINKEDIN_CLIENT_SECRET: str = ""
 
     # Apify Settings
-    APIFY_API_TOKEN: str = "apify_api_yasIcqzhgdPZSuzNoMDlLpipTGqJu93J8OFS"
+    APIFY_API_TOKEN: str = "apify_api_ov2XS5Lk9UEHqpdotGaoszOW9Uq2GN3x6ODL"
     APIFY_WEBHOOK_SECRET: str = "webhook_secret"
     
     # OpenAI Settings (for AI-powered analysis)
     OPENAI_API_KEY: str = ""
-    AI_MODEL: str = "gpt-4o-mini"  # or gpt-4, claude-3-5-sonnet, etc.
+    GEMINI_API_KEY: Optional[str] = "AIzaSyBB6Kyn5PkiP47dZOeUCgcQ0_eN3jWLm4M" # User provided key
+    AI_MODEL: str = "gemini-2.0-flash"  # Default model updated to gemini-pro
     
     # Apollo.io Settings (for lead enrichment)
     APOLLO_API_KEY: str = ""

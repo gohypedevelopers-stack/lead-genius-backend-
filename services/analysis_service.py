@@ -66,6 +66,9 @@ class AnalysisService:
                 {"post_urls": [url]}
             )
             
+            if not dataset_id:
+                raise Exception("Failed to fetch Post Details from Apify (Step 1 failed). Check Apify logs or credits.")
+            
             post_content = ""
             author_name = "Unknown"
             
@@ -98,7 +101,7 @@ class AnalysisService:
                     "postIds": [url],
                     "page_number": 1,
                     "sortOrder": "most relevant",
-                    "limit": 100
+                    "limit": 2
                 }
             )
             
@@ -115,7 +118,7 @@ class AnalysisService:
                     "post_urls": [url],
                     "page_number": 1,
                     "reaction_type": "ALL",
-                    "limit": 100
+                    "limit": 5
                 }
             )
             
